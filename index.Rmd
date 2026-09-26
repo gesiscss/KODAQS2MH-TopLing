@@ -70,9 +70,9 @@ library(proxy)
 library(remotes)
 library(gtools)
 
-if (!requireNamespace("piercer", quietly = TRUE)) {
-    remotes::install_github("sjpierce/piercer")
-}
+#if (!requireNamespace("piercer", quietly = TRUE)) {
+#    remotes::install_github("sjpierce/piercer")
+#}
 
 library(piercer)
 ```

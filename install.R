@@ -7,7 +7,7 @@ install_and_load_packages <- function() {
   if(length(to_install)) install.packages(to_install)
   lapply(cran_packages, library, character.only = TRUE)
   if (!requireNamespace("piercer", quietly = TRUE)) {
-    remotes::install_github("sjpierce/piercer")
+    remotes::install_github("sjpierce/piercer@7e53e108a1643e026ffa8a4cfac5bbcac845ea2a")
   }
   library(piercer)
 }
