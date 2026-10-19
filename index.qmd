@@ -1,0 +1,722 @@
+---
+title: "TopLing"
+subtitle: "Evaluating the Quality of Machine Translation for Multilingual Topic Modeling"
+author: 
+  - "Nadezhda (Nadja) Ozornina"
+  - "Yannik Peters"
+  - "Mario Haim"
+image: icon_TopLing.png
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document: default
+  pdf_document: default
+bibliography: references.bib
+---
+
+# At a glance
+
+This tutorial provides guidelines on evaluating the quality of machine translation as a consolidation strategy for multilingual topic modeling in `R`.
+
+By the end of this tutorial, you will be able to:
+
+-   Apply machine translation for text consolidation.
+-   Perform topic modeling on translated data.
+-   Measure metrics to evaluate the quality of machine translation for topic modeling.
+-   Identify topics with potential translation issues and inspect them.
+
+### Table of Content
+
+[Introduction](#introduction)
+
+[Setup](#setup)
+
+[Tool application](#tool-application)
+
+[Conclusion and recommendations](#conclusion-and-recommendations)
+
+# 1. Introduction {#introduction}
+
+## Background
+
+Topic modeling is a widely used text analysis approach in computational social science, enabling researchers to identify latent thematic structures of large-scale text collections [@jacobi_quantitative_2016]. However, the outcomes of this method are highly sensitive to data quality and preprocessing decisions [see @peters_comparing_2024], making consistent text preparation essential for producing interpretable and comparable results.
+
+A particularly important scenario for assessing data quality arises when working with text collections in multiple languages [@lind_building_2022]. In such cases, machine translation is often applied as a consolidation strategy [@reber_overcoming_2019], helping to bring multilingual data to a common denominator before the analysis. When combined with probabilistic topic modeling, this approach enables the identification of cross-lingual topics [@chan_reproducible_2020], however, the reliability of findings can be compromised by errors introduced during translation. This dependence on input quality represents a significant challenge in computational text analysis [@baden_integrated_2022] and highlights the need for clear guidelines on evaluating machine translation outputs and understanding their impact on topic modeling results.
+
+## Aims and Scope
+
+In this tutorial, we provide practical guidelines for evaluating machine translation quality for multilingual topic modeling, using a United Nations corpus in German language [@eisele_multiun_2010]. The documents (*N* = 994) are consolidated into English using *Google Translate*, and then translated back into German. On original German texts and texts resulted from back-and-forth translation, the algorithms of structural topic modeling (STM, @roberts_stm_2019) are applied. The results are compared using metrics of (a) feature overlap, (b) topical prevalence, and (c) topical content [@de_vries_no_2018], with outputs available for qualitative examination. Finally, we discuss the strengths and limitations of this approach in the context of computational social science.
+
+# 2. Setup {#setup}
+
+First, we load all relevant libraries. Please ensure to have all packages installed using the `install.packages()` command. The `piercer` package is only available from *GitHub*, so you need to use the `remotes` package to install it.
+
+```{r results='hide', warning=FALSE, message=FALSE}
+# Processing
+library(tidyverse)
+
+# Translation
+library(polyglotr)
+
+# Text analysis
+library(quanteda)
+library(stm)
+
+# Plotting
+library(VennDiagram)
+library(grid)
+
+# Calculations
+library(proxy)
+library(remotes)
+library(gtools)
+
+if (!requireNamespace("piercer", quietly = TRUE)) {
+    remotes::install_github("sjpierce/piercer")
+}
+
+library(piercer)
+```
+
+Second, we load the United Nations documents in German, representing a subsample of the open-source multilingual corpus originally published by @eisele_multiun_2010. The dataset includes resolutions and related documents and is used here as an example for evaluating translation quality. When applying this workflow to your own multilingual projects, you can use the provided scripts on subsamples in any of the languages included in your data.
+
+```{r}
+# Open and inspect the dataset
+documents <- readRDS("documents.rds")
+glimpse(documents)
+cat("Mean document length is", mean(str_count(documents$original, "\\S+")))
+```
+
+We see that our sample contains 994 documents in German, each consisting of slightly more than 1,000 words on average. This number of documents was chosen to illustrate the applicability of the tool while maintaining feasibility for analysis.
+
+# 3. Tool application {#tool-application}
+
+## 3.1. Translation
+
+The next step is to translate the German documents into English, being the *lingua franca* for consolidating multilingual data [@de_vries_no_2018], and then back into German. This process is called back-and-forth translation and is commonly used to evaluate the quality of machine translation systems [e.g. @baden_common_2015]. The more the topic model derived from the original German texts aligns with the model from the back-translated texts, the higher is the translation quality.
+
+For that, we first define a function which interacts with interface of *Google Translate* in the background and translates texts from a given language into English. The function reports any errors, discards affected documents from the dataset, and prints their IDs for later inspection.
+
+```{r warning=FALSE, message=FALSE}
+# Define the translation function
+translate <- function(docs_to_translate, lang_original, lang_translate, doc_ids) {
+  
+  # Create a function for one document
+  translate_document <- function(doc, i) {
+    tryCatch({
+      res <- google_translate_long_text(doc, 
+                                        source = lang_original, 
+                                        target = lang_translate, 
+                                        chunk_size = 1000, 
+                                        preserve_newlines = FALSE)
+      message("Document ", i, " translated from ", lang_original, " into ", lang_translate)
+      res
+    }, error = function(e) {
+      message("Document ", i, " translation failed: ", e$message)
+      NA_character_
+    })
+  }
+  
+  # Apply the function to all documents in the sample
+  translated <- Vectorize(translate_document, 
+                          vectorize.args = c("doc", "i"))(
+    docs_to_translate, doc_ids)
+  
+  # Create a tibble and remove failed translations
+  tib <- tibble(id = doc_ids,
+    original = docs_to_translate,
+    translated = translated)
+  tib <- tib[!is.na(tib$translated), ]
+  tib
+}
+```
+
+We apply the function to translate German texts into English and then back into German.
+
+::: callout-important
+Due to interacting directly with *Google Translate*, the provided algorithm runs very slow: in our case, translating all documents took about one hour per language pair. To speed up the translation process, we recommend using API services from Google or DeepL (for comparison between tools, see @reber_overcoming_2019). To bypass the speed limitations and enable direct use of the tool, we provide ready-made translations collected in November 2025 in the next section (3.2).
+:::
+
+```{r}
+# Translate documents from German into English
+#translation_forth <- translate(documents$text, "de", "en", documents$id)
+
+# Translate documents from English back into German
+#translation_back <- translate(translation_forth$translated, "en", "de", #translation_forth$id)
+
+# Save translated data
+#saveRDS(translation_forth, "translation_forth.rds")
+#saveRDS(translation_back, "translation_back.rds")
+```
+
+## 3.2. Preprocessing
+
+First, we read and inspect the translated data obtained after applying *Google Translate* to the analyzed documents. We also load a comprehensive list of German stopwords, combining spacyr [@benoit_spacyr_2017] and quanteda [@benoit_quanteda_2018], extended with Roman numerals relevant to our study. Other word lists or domain-specific stopwords can be applied as needed.
+
+```{r warning=FALSE, message=FALSE}
+# Read in translated data and stopwords
+translation_forth <- readRDS("translation_forth.rds")
+translation_back <- readRDS("translation_back.rds")
+stopwords <- readRDS("stopwords.rds")
+
+# Show data 
+cat("translation_forth:\n")
+glimpse(translation_forth)
+cat("translation_back:\n")
+glimpse(translation_back)
+cat("stopwords:\n")
+glimpse(stopwords)
+```
+
+Here, the dataframe `translation_forth` contains the results of translating German texts into English, with the column `original` for German texts and `translated` for their English versions. The dataframe `translation_back` contains the results of translating these English texts back into German, with the column `original` holding the English texts and `translated` containing the final results in German.
+
+Next, we define a preprocessing function that performs tokenization, stopword removal, stemming with `quanteda`, and relative pruning. For this, we follow the preprocessing guidelines from @maier_applying_2018 and @van_atteveldt_computational_2022. For real-world projects, we recommend applying lemmatization with `spacyr` instead of stemming, which is used here due to its simpler installation requirements.
+
+```{r warning=FALSE, message=FALSE}
+# Create preprocessing function
+process_and_create_dfm <- function(translation_df, field, stopwords) {
+  
+  # Create corpus
+  corpus <- translation_df %>%
+    corpus(text_field = field) 
+  
+  # Tokenize and preprocess
+  tokens_clean <- corpus %>%
+    tokens(what = "word", 
+           remove_punct = TRUE, 
+           remove_symbols = TRUE,
+           remove_numbers = TRUE, 
+           remove_url = TRUE, 
+           remove_separators = TRUE, 
+           split_hyphens = TRUE, 
+           split_tags = TRUE, 
+           include_docvars = FALSE) %>%
+    tokens_tolower() %>%
+    tokens_select(stopwords, 
+                  selection = "remove") %>%
+    tokens_wordstem()
+  
+  # Create DFM and apply relative pruning
+  dfm_result <- dfm(tokens_clean)
+  dfm_result <- dfm_trim(dfm_result, 
+                         min_docfreq = 0.005, 
+                         max_docfreq = 0.99,
+                         docfreq_type = 'prop', 
+                         verbose = TRUE)
+  
+  return(dfm_result)
+}
+
+```
+
+We apply this function to the original German texts as well as to the results of translating these texts back and forth into German. Next, we examine the document-feature matrices (DFMs) generated through preprocessing.
+
+```{r warning=FALSE, message=FALSE}
+# Apply preprocessing
+dfm_original <- process_and_create_dfm(translation_forth, "original", stopwords) # original German texts
+dfm_translated <- process_and_create_dfm(translation_back, "translated", stopwords) # translated back-and-forth
+
+# Print preprocessing summary
+cat("DFM from Original Texts (dfm_original):\n")
+dfm_original
+cat("DFM after Back-and-forth Translation (dfm_translated):\n")
+dfm_translated 
+
+# Save the results
+saveRDS(dfm_original, file = "dfm_original.rds")
+saveRDS(dfm_translated, file = "dfm_translated.rds")
+```
+
+With preprocessing complete, we can move to topic modeling.
+
+## 3.3. Topic Modeling
+
+### 3.3.1. Choosing the number of topics
+
+Now, we want to apply topic modeling separate to the DFM `dfm_original`, based on original German texts, and to the DFM `dfm_translated`, obtained from translating the texts to English and back into German.
+
+The first step in topic modeling is to determine the optimal number of topics (*K*) for both analyzed DFMs. Since the focus of this tutorial is on examining the machine translation quality, we use a simplified approach for selecting the number of topics, utilizing the built-in functionality in the `STM` package [@roberts_stm_2019]. For more robust analyses, it is strongly recommended to consider multiple evaluation metrics and qualitative assessments; for guidance, see @maier_applying_2018 and @bernhard_topic_2023.
+
+```{r warning=FALSE, message=FALSE}
+# Important: Execution time may vary by hardware and can take up to approximately 10 minutes.
+# Prepare the data and define the numbers of topics to be examined
+dfm_original_stm <- dfm_original %>% 
+  convert(to = "stm")
+dfm_translated_stm <- dfm_translated %>% 
+  convert(to = "stm")
+Ks <- seq(5, 30, 5) # test for 5, 10, 15, 20, 25, 30 topics
+
+# Apply function for metrics calculation from the STM package
+kresult_original <- searchK(documents = dfm_original_stm$documents, 
+                            vocab = dfm_original_stm$vocab, 
+                            K = Ks, 
+                            init.type = "Spectral", 
+                            verbose = FALSE)
+kresult_translated <- searchK(documents = dfm_translated_stm$documents, 
+                              vocab = dfm_translated_stm$vocab, 
+                              K = Ks, 
+                              init.type = "Spectral", 
+                              verbose = FALSE)
+
+# Plot the results
+plot(kresult_original, main = "Number of Topics (K) for Original Texts")
+plot(kresult_translated, main = "Number of Topics (K) for Back-and-forth Translation")
+```
+
+We then evaluate the plots to identify the solution that produces the most coherent topics, with the lowest residuals and the highest held-out likelihood (for details, see @roberts_stm_2019). Based on these metrics, the optimal number of topics appears to be between 10 and 15 for both DFMs. Accordingly, we choose to fit a model with 10 topics.
+
+### 3.3.2. Calculating the topic models
+
+The second step is to estimate the topic models themselves. For that, we use the `STM` package and apply spectral initialization to ensure the reproducibility of the outcomes. We then print a summary of the fitted model along with the top words for each topic. Here, FREX words are recommended for labeling and qualitative examination, as they balance frequency and exclusivity, making them well-suited to characterize each topic.
+
+```{r warning=FALSE, message=FALSE}
+# Important: Execution time may vary by hardware and can take up to approximately 5 minutes.
+# Calculate topic models
+model_original <- stm(documents = dfm_original_stm$documents, 
+                      vocab = dfm_original_stm$vocab, 
+                      K = 10,
+                      init.type = "Spectral", 
+                      max.em.its = 500, 
+                      verbose = FALSE)
+model_translated <- stm(documents = dfm_translated_stm$documents, 
+                        vocab = dfm_translated_stm$vocab, 
+                        K = 10,
+                        init.type = "Spectral", 
+                        max.em.its = 500, 
+                        verbose = FALSE)
+
+# Print model summary
+cat("Summary of Model for Original Texts (model_original):\n")
+summary(model_original)
+cat("Summary of Model for Back-and-forth Translation (model_translated):\n")
+summary(model_translated)
+
+# Save the results
+saveRDS(model_original, file = "model_original.rds")
+saveRDS(model_translated, file = "model_translated.rds")
+```
+
+### 3.3.3. Topic matching and comparison
+
+To assess whether topic modeling produced similar topics for the original German texts and the back-and-forth translated texts, we match the topics from both models (`model_original` and `model_translated`) based on similarities in their word probabilities. This approach allows us to identify the most similar (matching) topics across the two models. The function, originally based on the approach by @de_vries_no_2018, also extracts and pre-saves values comparing topic distributions and top words, which we use in the subsequent analysis steps for comparison (3.4).
+
+```{r warning=FALSE, message=FALSE}
+# Load topic models
+model_original <- readRDS("model_original.rds")
+model_translated <- readRDS("model_translated.rds")
+
+# Create function for topic matching and comparison
+comparizer <- function(topics, model_original, model_translated) {
+  
+  # Extract terms
+  model_original.terms <- t(labelTopics(model_original, n = 50)$frex)
+  colnames(model_original.terms) <- paste("Topic", 1:ncol(model_original.terms))
+  
+  model_translated.terms <- t(labelTopics(model_translated, n = 50)$frex)
+  colnames(model_translated.terms) <- paste("Topic", 1:ncol(model_translated.terms))
+  
+  # Extract topic probabilities
+  model_original.topicprobs <- as.matrix(model_original$theta)
+  model_translated.topicprobs <- as.matrix(model_translated$theta)
+  
+  # Extract word probabilities
+  model_original.wordprobs <- t(exp(model_original$beta$logbeta[[1]]))
+  rownames(model_original.wordprobs) <- model_original$vocab
+  colnames(model_original.wordprobs) <- 1:ncol(model_original.wordprobs)
+  model_translated.wordprobs <- t(exp(model_translated$beta$logbeta[[1]]))
+  rownames(model_translated.wordprobs) <- model_translated$vocab
+  colnames(model_translated.wordprobs) <- 1:ncol(model_translated.wordprobs)
+  
+  # Identify overlapping words
+  words_overlap <- intersect(rownames(model_original.wordprobs), rownames(model_translated.wordprobs))
+  
+  # Keep only overlapping words, alphabetically ordered
+  original_wordprobs_temp <- model_original.wordprobs[words_overlap, , drop = FALSE] %>%
+    as_tibble(rownames = "word") %>%
+    arrange(word) %>%
+    column_to_rownames("word")
+  translated_wordprobs_temp <- model_translated.wordprobs[words_overlap, , drop = FALSE] %>%
+    as_tibble(rownames = "word") %>%
+    arrange(word) %>%
+    column_to_rownames("word")
+  
+  # Compute topic pairs for each word
+  topic_comb <- lapply(rownames(original_wordprobs_temp), function(word) {
+    paste(
+      which.max(original_wordprobs_temp[word, ]),
+      which.max(translated_wordprobs_temp[word, ]),
+      sep = ","
+    )
+  })
+  
+  # Count and sort topic pairs 
+  topic_comb_tab <- sort(table(unlist(topic_comb)), decreasing = TRUE)
+  topic_comb_names <- names(topic_comb_tab)
+  
+  # Create unique topic pairs 
+  topic_original <- character()
+  topic_translated <- character()
+  topic_unique <- unlist(lapply(topic_comb_names, function(tc) {
+    temp <- strsplit(tc, ",", fixed = TRUE)[[1]]
+    original <- temp[1]
+    translated <- temp[2]
+    if (!original %in% topic_original && !translated %in% topic_translated) {
+      topic_original <<- c(topic_original, original)
+      topic_translated <<- c(topic_translated, translated)
+      paste(original, ",", translated, sep = "")
+    }
+  }))
+  
+  # Identify unassigned topics
+  not_assigned_original <- setdiff(as.character(seq_len(topics)), topic_original)
+  not_assigned_translated <- setdiff(as.character(seq_len(topics)), topic_translated)
+  topic_unique <- mixedsort(topic_unique)
+  print("Unique topic pairs:")
+  print(topic_unique)
+  print("Not assigned topics in original model:")
+  print(not_assigned_original)
+  print("Not assigned topics in translated model:")
+  print(not_assigned_translated)
+  
+  # Compute translated column order and reorder matrices
+  translated_order <- as.numeric(sapply(topic_unique, function(tu) strsplit(tu, ",")[[1]][2]))
+  original_order <- c(not_assigned_original, translated_order)
+  colnames(model_original.wordprobs) <- colnames(model_original.topicprobs) <- colnames(model_original.terms) <- 1:topics
+  colnames(model_translated.wordprobs) <- colnames(model_translated.topicprobs) <- colnames(model_translated.terms) <- 1:topics
+  if(length(not_assigned_original) > 0){
+    remove_idx <- as.numeric(not_assigned_original)
+    model_original.wordprobs <- model_original.wordprobs[, -remove_idx]
+    model_original.topicprobs <- model_original.topicprobs[, -remove_idx]
+    model_original.terms <- model_original.terms[, -remove_idx]
+    original_wordprobs_temp <- original_wordprobs_temp[, -remove_idx]
+  }
+  model_translated.wordprobs <- model_translated.wordprobs[, translated_order]
+  model_translated.topicprobs <- model_translated.topicprobs[, translated_order]
+  model_translated.terms <- model_translated.terms[, translated_order]
+  translated_wordprobs_temp <- translated_wordprobs_temp[, translated_order]
+  if(length(not_assigned_translated) > 0){
+    remove_idx <- seq_len(length(not_assigned_translated))
+    model_translated.wordprobs <- model_translated.wordprobs[, -remove_idx]
+    model_translated.topicprobs <- model_translated.topicprobs[, -remove_idx]
+    model_translated.terms <- model_translated.terms[, -remove_idx]
+    translated_wordprobs_temp <- translated_wordprobs_temp[, -remove_idx]
+  }
+  
+  # Compute similarity matrices
+  doc2DocDistrCor <- simil(model_original.topicprobs, model_translated.topicprobs, method="correlation", by_rows=TRUE, pairwise=TRUE)
+  doc2DocDistrCos <- simil(model_original.topicprobs, model_translated.topicprobs, method="cosine", by_rows=TRUE, pairwise=TRUE)
+  topic2TopicDistrCor <- simil(model_original.topicprobs, model_translated.topicprobs, method="correlation", by_rows=FALSE, pairwise=TRUE)
+  topic2TopicDistrCos <- simil(model_original.topicprobs, model_translated.topicprobs, method="cosine", by_rows=FALSE, pairwise=TRUE)
+  topic2TopicSimilCor <- simil(original_wordprobs_temp, translated_wordprobs_temp, method="correlation", by_rows=FALSE, pairwise=TRUE)
+  topic2TopicSimilCos <- simil(original_wordprobs_temp, translated_wordprobs_temp, method="cosine", by_rows=FALSE, pairwise=TRUE)
+  
+  # Return all results as a list
+  return(list(
+    model_original_terms = model_original.terms,
+    model_translated_terms = model_translated.terms,
+    model_original_topicprobs = model_original.topicprobs,
+    model_translated_topicprobs = model_translated.topicprobs,
+    model_original_wordprobs = model_original.wordprobs,
+    model_translated_wordprobs = model_translated.wordprobs,
+    unique_pairs = topic_unique,
+    doc2DocDistrCor = doc2DocDistrCor,
+    doc2DocDistrCos = doc2DocDistrCos,
+    topic2TopicDistrCor = topic2TopicDistrCor,
+    topic2TopicDistrCos = topic2TopicDistrCos,
+    topic2TopicSimilCor = topic2TopicSimilCor,
+    topic2TopicSimilCos = topic2TopicSimilCos
+  ))
+}
+
+# Apply
+results <- comparizer(10, model_original, model_translated)
+saveRDS(results, "results.rds")
+```
+
+We observe that all topics in our models were successfully matched. If this is not the case for your data, we recommend examining the unmatched topics to identify potential reasons for discrepancies, including issues related to machine translation.
+
+## 3.4. Evaluating translation quality
+
+### 3.4.1. Feature overlap
+
+We begin with the first metric for evaluating the quality of machine translation, called *feature overlap* [@de_vries_no_2018]. This metric measures the extent to which the DFMs use the same features (in our case, stems), with a higher degree of overlap indicating stronger alignment. The results are expressed as a percentage, reflecting how much the translated data share a similar vocabulary with the original texts.
+
+```{r warning=FALSE, message=FALSE}
+# Load DFMs
+dfm_original <- readRDS("dfm_original.rds")
+dfm_translated <- readRDS("dfm_translated.rds")
+
+# Calculate feature counts
+features_original <- length(unique(featnames(dfm_original)))
+features_translated <- length(unique(featnames(dfm_translated)))
+features_overlap <- length(intersect(featnames(dfm_original), featnames(dfm_translated)))
+features_total <- features_original + features_translated - features_overlap
+
+# Draw Venn diagram with percentages
+venn <- draw.pairwise.venn(area1 = features_original,
+                           area2 = features_translated,
+                           cross.area = features_overlap,
+                           cex = 1.0, 
+                           cat.cex = 0.8,
+                           fill = c("gray50", "gray80"), 
+                           alpha = c(0.7, 0.7),
+                           lty = "solid", 
+                           col = "black",
+                           cat.fontfamily = "Helvetica", 
+                           fontfamily = "Helvetica",
+                           ind = FALSE
+                           )
+venn_labels <- sapply(venn[5:7], function(x) {
+  label <- as.numeric(x$label)
+  sprintf("%d\n(%.2f%%)", label, label / features_total * 100)
+})
+for (i in 5:7) venn[[i]]$label <- venn_labels[i - 4]
+
+# Draw diagram
+grid.newpage()
+grid.draw(venn)
+grid.text("dfm_original", 0.1, 0.9, gp = gpar(fontsize = 10))
+grid.text("dfm_translated", 0.9, 0.9, gp = gpar(fontsize = 10))
+```
+
+The output is a Venn diagram showing that 67.37% of features from the two DFMs appear in both the original and translated data. This generally aligns with previous studies on the impact of machine translation on topic models [@de_vries_no_2018; @reber_overcoming_2019], which report slightly higher overlaps (around 75%) for parallel corpora. For other language pairs and text types, overlap benchmarks may be lower, for example, to around 50% in journalistic texts.
+
+### 3.4.2. Topical prevalence
+
+The subsequent comparisons are conducted at the level of the topic models. The next metric, called *topical prevalence*, indicates the extent to which the matched topics are similarly distributed across the original and translated data. This is assessed through correlations computed for each topic pair and averaged across all topics. The algorithms for these calculations are detailed in @de_vries_no_2018.
+
+```{r warning=FALSE, message=FALSE}
+# Load data
+model_original <- readRDS("model_original.rds")
+model_translated <- readRDS("model_translated.rds")
+results <- readRDS("results.rds")
+
+# Create function for calculating confidence intervals
+compute_mean_statistics <- function(data, ndoc) {
+  ci <- ci.rp(data, ndoc)
+  tibble(id = seq_along(data),
+         corr = data,
+         topic_id = factor(seq_along(data), levels = seq_along(data)),
+         overall_mean = mean(data),
+         ci.CI.LL = ci$CI.LL,
+         ci.CI.UL = ci$CI.UL) %>%
+    arrange(corr)
+  }
+
+# Create function for topical prevalence
+create_prevalence_plot <- function(data, title_text) {
+  ggplot(data, 
+         aes(x = corr, y = topic_id)) +
+    geom_point(size = 1.5) +
+    geom_errorbar(aes(xmin = ci.CI.LL, xmax = ci.CI.UL),
+                  width = 0.2, 
+                  color = "gray60", 
+                  size = 0.5) +
+    geom_vline(xintercept = mean(data$corr),
+               linetype = "dashed", 
+               color = "gray30", 
+               size = 0.8) +
+    annotate("text",
+             x = mean(data$corr), 
+             y = 1,
+             label = paste0("Mean: ", round(mean(data$corr), 2)),
+             hjust = -0.1, 
+             size = 3.5, 
+             color = "black") +
+    labs(title = title_text,
+         x = "Correlation in Topical Prevalence",
+         y = "Topic Number") +
+    scale_x_continuous(limits = c(-0.2, 1.1),
+                       breaks = seq(0, 1, 0.2)) +
+    theme_minimal(base_size = 10)
+}
+
+# Apply to the data
+topic2TopicDistrCor <- compute_mean_statistics(as.vector(results$topic2TopicDistrCor),
+                                               nrow(model_original$theta))
+create_prevalence_plot(topic2TopicDistrCor,
+  "Correlation in Topical Prevalence between Original and Translated Texts")
+```
+
+On average, the matched topics show a similarity of 0.73 in their distribution across the original and translated corpora, indicating sufficient agreement in topical prevalence. This aligns with previous findings, where @de_vries_no_2018 and @reber_overcoming_2019 report correlations of around 0.70 for parallel texts. We also observe that topic pair 6, where the number refers to the topic in the original German model, has a noticeably lower correlation, which may be attributed to potential translation issues.
+
+In addition to this evaluation, it is also possible to examine topical prevalence at the document level. We do not include this analysis here, as it produces nearly identical results. For examples of such calculations, see the supplementary materials of @de_vries_no_2018.
+
+### 3.4.3. Topical content
+
+*Topical content* indicates the extent to which the word distributions across matched topics from the compared models correlate with each other. Higher correlations reflect greater similarity in the word distributions within topics and show stronger alignment in the underlying vocabulary of the topic matches.
+
+```{r warning=FALSE, message=FALSE}
+# Load data
+results <- readRDS("results.rds")
+
+# Create function for topical content
+create_content_plot <- function(data, title_text) {
+  mean_corr <- mean(data$corr)
+  ggplot(data, 
+         aes(x = corr, y = topic_id)) +
+    geom_point(size = 1.5, 
+               color = "black") +
+    geom_errorbar(aes(xmin = ci.CI.LL, xmax = ci.CI.UL),
+                  width = 0.2, 
+                  color = "gray60", 
+                  size = 0.5) +
+    geom_vline(xintercept = mean_corr, 
+               linetype = "dashed", 
+               color = "gray30", 
+               size = 0.8) +
+    annotate("text", 
+             x = mean_corr, y = 1,
+             label = sprintf("Mean: %.2f", mean_corr),
+             hjust = -0.1, 
+             size = 3.5, 
+             color = "black") +
+    labs(title = title_text,
+         x = "Correlation in Topical Content",
+         y = "Topic Number") +
+    scale_x_continuous(limits = c(-0.2, 1.1), 
+                       breaks = seq(0, 1, 0.2)) +
+    theme_minimal(base_size = 10)
+}
+
+# Apply to the data
+# Important: for this function, steps 3.4.1. and 3.4.2. have to be executed
+topic2TopicSimilCor <- compute_mean_statistics(as.vector(results$topic2TopicSimilCor), 
+                                               features_total)  
+create_content_plot(topic2TopicSimilCor, 
+  "Correlation in Topical Content between Original and Translated Texts")
+
+```
+
+The results indicate that word distributions across matched topics are highly similar, with an average correlation of 0.91, higher values around 0.70 reported in @de_vries_no_2018. As with topical prevalence, all topic pairs except for topic 6 show strong similarity. This outlier will be examined qualitatively in the next step of the analysis.
+
+## 3.4. Strategies for qualitative assessment
+
+The final step of the analysis is to qualitatively evaluate the possible reasons for mismatches in topical prevalence and topical content between the original and translated data. In this step, we can extract the top words and documents for the topic pairs identified as relevant in the previous section. Based on this evaluation, we chose to investigate the inconsistencies in topic pair number 6.
+
+```{r}
+# Load data
+model_original <- readRDS("model_original.rds")
+model_translated <- readRDS("model_translated.rds")
+results <- readRDS("results.rds")
+translation_forth <- readRDS("translation_forth.rds")
+translation_back <- readRDS("translation_back.rds")
+
+# Create function for extraction of top words and documents
+inspect_topic_pairs <- function(model_original_terms, model_translated_terms,
+                                model_original_theta, model_translated_theta,
+                                unique_pairs, topic_pair_number,
+                                texts_original, texts_translated, 
+                                top_n_words, top_n_docs) {
+  # Split topic numbers
+  topic_original = topic_pair_number
+  match_pair <- unique_pairs[grepl(paste0("^", topic_original, ","), unique_pairs)]
+  if (length(match_pair) == 0) {
+    stop("No matching translated topic found for original topic ", topic_original)
+  }
+  topic_translated <- as.numeric(strsplit(match_pair, ",")[[1]][2])
+  cat("Comparing topic pair: Original =", topic_original, ", Translated =", topic_translated, "\n")
+  
+  # Top words
+  cat("\nTop words (original):\n")
+  print(model_original_terms[1:top_n_words, topic_original])
+  cat("\nTop words (translated):\n")
+  print(model_translated_terms[1:top_n_words, topic_translated])
+    
+  # Top documents
+  theta_original <- model_original_theta[, topic_original]
+  theta_translated <- model_translated_theta[, topic_translated]
+  top_docs_original <- order(theta_original, decreasing = TRUE)[1:top_n_docs]
+  top_docs_translated <- order(theta_translated, decreasing = TRUE)[1:top_n_docs]
+  
+  # Output
+  cat("\nTop documents (original):\n")
+  print(texts_original[top_docs_original])
+  cat("\nTop documents (translated):\n")
+  print(texts_translated[top_docs_translated])
+  
+}
+
+# Apply function
+topic_pair_number <- 6
+top_n_words <- 20
+top_n_docs <- 1
+inspect_topic_pairs(results$model_original_terms,
+                    results$model_translated_terms,
+                    results$model_original_topicprobs,
+                    results$model_translated_topicprobs,
+                    results$unique_pairs, topic_pair_number, 
+                    translation_forth$original, translation_back$translated,
+                    top_n_words, top_n_docs)
+```
+
+Based on the output, we observe that the matched topics in pair number 6 use different top words. However, it is unclear whether these differences arise from translation errors or from artifacts of the topic modeling process itself [@maier_machine_2022].
+
+To investigate this, we extract the context of selected words from both the original and translated data using the KWIC (Key Word in Context) method. This allows us to examine the frequency of each word and inspect its surrounding text, helping to identify potential translation issues. As an example, we focus on the word “Menschenrechtserziehung” (*human rights education*).
+
+```{r}
+# KWIC function
+get_kwic <- function(texts, word, window = 5) {
+  word_pattern <- paste0("\\b", word, "\\b")
+  
+  unlist(lapply(texts, function(txt) {
+    if (is.na(txt) || txt == "") return(NA_character_)
+    
+    words <- unlist(str_split(txt, "\\s+"))
+    positions <- which(str_detect(words, regex(word_pattern, ignore_case = TRUE)))
+    
+    if(length(positions) == 0) return(NA_character_)
+    
+    contexts <- sapply(positions, function(pos) {
+      start <- max(1, pos - window)
+      end <- min(length(words), pos + window)
+      paste(words[start:end], collapse = " ")
+    })
+    
+    paste(contexts, collapse = " | ")
+  }))
+}
+
+# Main function
+extract_kwic <- function(word_of_interest, translation_back, translation_forth, window = 5, id_col = "id") {
+  
+  # Occurrences in "original"
+  forth_kwic <- translation_forth %>%
+    filter(str_detect(.data[["original"]], regex(word_of_interest, ignore_case = TRUE))) %>%
+    select(all_of(id_col), original, translated) %>%
+    mutate(
+      original_kwic = get_kwic(original, word_of_interest, window)
+    )
+  
+  # Occurrences in "translated"
+  back_kwic <- translation_back %>%
+    filter(str_detect(.data[["translated"]], regex(word_of_interest, ignore_case = TRUE))) %>%
+    select(all_of(id_col), original, translated) %>%
+    mutate(
+      translated_kwic = get_kwic(translated, word_of_interest, window)
+    )
+  
+  # Combine into one data frame
+  kwic_df <- full_join(forth_kwic, back_kwic, by = "id")
+  kwic_df <- kwic_df %>%
+    select(all_of(id_col), original_kwic, translated_kwic)
+  
+  return(kwic_df)
+}
+
+# Example usage
+word_of_interest <- "menschenrechtserziehung"
+result_kwic <- extract_kwic(word_of_interest, translation_back, translation_forth, window = 3)
+
+print(result_kwic)
+
+```
+
+We observe that the word is also present in the translated dataset, remaining unchanged after the back-and-forth translation in 16 out of 17 cases. Furthermore, the meanings revealed by the KWIC analysis remain consistent (interpreted based on German content), indicating that no severe translation issues are present regarding this particular top word. Further words can be examined using the same approach to further validate this observation.
+
+# 4. Conclusion and recommendations {#conclusion-and-recommendations}
+
+This tutorial provides a foundation for evaluating the quality of machine translation in the context of multilingual topic modeling. The proposed metrics enable a comprehensive evaluation of impacts of machine translation on topic modeling outcomes and can be applied to other study cases when examining back-and-forth translation outputs. The metrics applied in the study, adapted from @de_vries_no_2018, are valuable for input validation and offer a basis for future evaluations, contributing to the growing body of literature and emerging guidelines on multilingual analysis, while acknowledging critiques regarding the privileging of English over other languages in research [@lind_building_2022; @baden_integrated_2022].
+
+A key limitation of this tutorial is that it considers only one language pair and relies solely on the UN text corpus. While there are studies using other types of data and languages [e.g. @maier_machine_2022], further cases need to be explored, possibly enriched through closer involvement of language and cultural expertise. Moreover, the abilities of advanced approaches, including embedding-based methods [e.g. @grootendorst_bertopic_2022], for multilingual topic modeling remain uncovered and should be addressed in future studied. Nevertheless, the application of this tool remains relevant in contexts of probabilistic approaches, which remain widely used, interpretable, and allow control over data quality at each stage of the analysis.
+
+# References
